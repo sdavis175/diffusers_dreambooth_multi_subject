@@ -166,18 +166,25 @@ def parse_args(input_args=None):
         help="A folder containing the training data of class images.",
     )
     parser.add_argument(
-        "--instance_prompt",
+        "--class_prompt_dir",
         type=str,
         default=None,
-        required=True,
-        help="The prompt with identifier specifying the instance",
+        required=False,
+        help="A folder containing the training data of class prompts.",
     )
-    parser.add_argument(
-        "--class_prompt",
-        type=str,
-        default=None,
-        help="The prompt to specify images in the same class as provided instance images.",
-    )
+    # parser.add_argument(
+    #     "--instance_prompt",
+    #     type=str,
+    #     default=None,
+    #     required=True,
+    #     help="The prompt with identifier specifying the instance",
+    # )
+    # parser.add_argument(
+    #     "--class_prompt",
+    #     type=str,
+    #     default=None,
+    #     help="The prompt to specify images in the same class as provided instance images.",
+    # )
     parser.add_argument(
         "--with_prior_preservation",
         default=False,
@@ -429,8 +436,8 @@ def parse_args(input_args=None):
     if args.with_prior_preservation:
         if args.class_data_dir is None:
             raise ValueError("You must specify a data directory for class images.")
-        if args.class_prompt is None:
-            raise ValueError("You must specify prompt for class images.")
+        # if args.class_prompt is None:
+        #     raise ValueError("You must specify prompt for class images.")
     else:
         # logger is not available yet
         if args.class_data_dir is not None:
@@ -525,6 +532,40 @@ class DreamBoothDataset(Dataset):
 
         return example
 
+    """
+    /dataset/
+        (Provided Images)
+        -instances/
+            (class name based on folder name)
+            -knightro/...
+                - prompt.txt -> a photo of sks knightro
+                - class_prompt.txt -> a photo of knightro
+                - 512x512 .jpg
+            -bunny/...
+                - prompt.txt -> a photo of zwx bunny
+                - class_prompt.txt -> a photo of bunny
+                - 512x512 .jpg
+        
+        (Generated Regularization Images)
+        -class_dir/
+            -class_images/
+                -512x512 .jpg
+            -class_prompts/
+                -prompt .txt (same name as associated image) -> a photo of a {rare_token} {class}
+    """
+    def append_data(self, new_instance_dir, new_instance_prompt):
+        """
+        Reassign instance dir variables to new_instance_dir. Reassign to new instance prompt as well.
+        Take files in old_instance_dir and move them to the class_dir and images. Be sure to create
+        class_prompt text files for them as well.
+        Args:
+            new_instance_dir:
+            new_instance_prompt:
+
+        Returns:
+
+        """
+        pass
 
 def collate_fn(examples, with_prior_preservation=False):
     input_ids = [example["instance_prompt_ids"] for example in examples]
@@ -622,9 +663,16 @@ def main(args):
     # Generate class images if prior preservation is enabled.
     if args.with_prior_preservation:
         class_images_dir = Path(args.class_data_dir)
+        class_prompts_dir = Path(args.class_prompt_dir)
         if not class_images_dir.exists():
             class_images_dir.mkdir(parents=True)
-        cur_class_images = len(list(class_images_dir.iterdir()))
+        if not class_prompts_dir.exists():
+            class_prompts_dir.mkdir(parents=True)
+
+        # Get the instances
+        instances_dir = Path(args.instance_data_dir)
+        instances = [instance.name for instance in instances_dir.glob("*") if instance.is_dir()]
+        cur_class_images = len(list(class_images_dir.iterdir())) // len(instances)
 
         if cur_class_images < args.num_class_images:
             torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
@@ -641,25 +689,31 @@ def main(args):
                 revision=args.revision,
             )
             pipeline.set_progress_bar_config(disable=True)
+            for instance in instances:
+                num_new_images = args.num_class_images - cur_class_images
+                logger.info(f"Number of class images to sample: {num_new_images}.")
+                class_prompt_dir = Path(f"{args.instance_data_dir}/{instance}/class_prompt.txt")
+                with open(class_prompt_dir, "r") as class_prompt_file:
+                    class_prompt = class_prompt_file.read()
 
-            num_new_images = args.num_class_images - cur_class_images
-            logger.info(f"Number of class images to sample: {num_new_images}.")
+                sample_dataset = PromptDataset(class_prompt, num_new_images)
+                sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
 
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
+                sample_dataloader = accelerator.prepare(sample_dataloader)
+                pipeline.to(accelerator.device)
 
-            sample_dataloader = accelerator.prepare(sample_dataloader)
-            pipeline.to(accelerator.device)
+                for example in tqdm(
+                        sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+                ):
+                    images = pipeline(example["prompt"]).images
 
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                images = pipeline(example["prompt"]).images
-
-                for i, image in enumerate(images):
-                    hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
+                    for i, image in enumerate(images):
+                        hash_image = hashlib.sha1(image.tobytes()).hexdigest()
+                        image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                        text_filename = class_prompts_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.txt"
+                        with open(text_filename, "w") as text_file:
+                            text_file.write(example["prompt"][i])
+                        image.save(image_filename)
 
             del pipeline
             if torch.cuda.is_available():
