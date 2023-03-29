@@ -457,10 +457,8 @@ class DreamBoothDataset(Dataset):
     def __init__(
         self,
         instance_data_root,
-        instance_prompt,
         tokenizer,
         class_data_root=None,
-        class_prompt=None,
         class_num=None,
         size=512,
         center_crop=False,
@@ -473,9 +471,9 @@ class DreamBoothDataset(Dataset):
         if not self.instance_data_root.exists():
             raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
 
-        self.instance_images_path = list(Path(instance_data_root).iterdir())
+        self.instance_images_path = list(Path(instance_data_root).rglob('*'))
+        self.instance_images_path = [i for i in self.instance_images_path if not os.path.basename(i).endswith('.txt') and not os.path.isdir(i)]
         self.num_instance_images = len(self.instance_images_path)
-        self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
 
         if class_data_root is not None:
@@ -487,7 +485,6 @@ class DreamBoothDataset(Dataset):
             else:
                 self.num_class_images = len(self.class_images_path)
             self._length = max(self.num_class_images, self.num_instance_images)
-            self.class_prompt = class_prompt
         else:
             self.class_data_root = None
 
@@ -506,11 +503,16 @@ class DreamBoothDataset(Dataset):
     def __getitem__(self, index):
         example = {}
         instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        instance_prompt = ""
+        name = str(self.instance_images_path[index % self.num_instance_images])
+        with open(name.rsplit('/', 1)[0] + r'/prompt.txt', 'r') as f:
+            instance_prompt = f.read()
+        #print("Accessing ", name.rsplit('/', 1)[0] + 'prompt.txt', instance_prompt)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
+            instance_prompt,
             truncation=True,
             padding="max_length",
             max_length=self.tokenizer.model_max_length,
@@ -519,11 +521,16 @@ class DreamBoothDataset(Dataset):
 
         if self.class_data_root:
             class_image = Image.open(self.class_images_path[index % self.num_class_images])
+            name = str(self.class_images_path[index % self.num_class_images])
+            class_prompt = ""
+            with open(name.rsplit('/', 2)[0] + "/class_prompts/" + name.rsplit('/', 1)[1].split('.')[0] + '.txt', 'r') as f:
+                class_prompt = f.read()
+            #print("Accessing ", name, class_prompt)
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
             example["class_prompt_ids"] = self.tokenizer(
-                self.class_prompt,
+                class_prompt,
                 truncation=True,
                 padding="max_length",
                 max_length=self.tokenizer.model_max_length,
@@ -869,9 +876,7 @@ def main(args):
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
         class_num=args.num_class_images,
         tokenizer=tokenizer,
         size=args.resolution,
