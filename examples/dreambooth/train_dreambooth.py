@@ -1187,21 +1187,19 @@ def main(args):
 
                 ###### END OF MODIFIED CODE ######
                 if args.train_text_encoder:
-                    # Early stop on training text encoder.
-                    if epoch < 75:
-                        # If batch is full.
-                        if len(batch["prompts"]) == args.train_batch_size*2:
-                            if batch["identities"].shape[0] > 1:
-                                new_text_embedding = text_encoder(batch["identities"]).pooler_output
-                                sim = 0
-                                for pair in itertools.combinations(list(new_text_embedding), 2):
-                                    sim += 1 - text_criterion(pair[0], pair[1])
-                                text_enc_loss = sim/len(list(itertools.combinations(list(new_text_embedding), 2)))
-                                # text_enc_loss = 1 - torch.nn.CosineSimilarity(dim=0)(new_text_embedding[0], new_text_embedding[1])
-                                loss -= text_enc_loss
-                                # if batch["prompts"][0] != batch["prompts"][2]:
-                                    # Compute the loss on the text encoder.
-                                    # text_enc_loss = NTXentLoss(device='cuda', batch_size=args.train_batch_size, temperature=0.1, use_cosine_similarity=True)(text_embedding[:args.train_batch_size], text_embedding[args.train_batch_size:])
+                    # If batch is full.
+                    if len(batch["prompts"]) == args.train_batch_size*2:
+                        if batch["identities"].shape[0] > 1:
+                            new_text_embedding = text_encoder(batch["identities"]).pooler_output
+                            sim = 0
+                            for pair in itertools.combinations(list(new_text_embedding), 2):
+                                sim += 1 - text_criterion(pair[0], pair[1])
+                            text_enc_loss = sim/len(list(itertools.combinations(list(new_text_embedding), 2)))
+                            # text_enc_loss = 1 - torch.nn.CosineSimilarity(dim=0)(new_text_embedding[0], new_text_embedding[1])
+                            loss -= text_enc_loss
+                            # if batch["prompts"][0] != batch["prompts"][2]:
+                                # Compute the loss on the text encoder.
+                                # text_enc_loss = NTXentLoss(device='cuda', batch_size=args.train_batch_size, temperature=0.1, use_cosine_similarity=True)(text_embedding[:args.train_batch_size], text_embedding[args.train_batch_size:])
 
                 accelerator.backward(loss, retain_graph=True)
 
