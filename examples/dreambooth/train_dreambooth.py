@@ -85,20 +85,22 @@ def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight
     # run inference
     generator = None if args.seed is None else torch.Generator(device=accelerator.device).manual_seed(args.seed)
     images = []
-    for _ in range(args.num_validation_images):
-        with torch.autocast("cuda"):
-            image = pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
-        images.append(image)
+    for validation_prompt in args.validation_prompt.split("|"):
+        for _ in range(args.num_validation_images):
+            with torch.autocast("cuda"):
+                image = pipeline(validation_prompt, num_inference_steps=25, generator=generator).images[0]
+            images.append((validation_prompt, image))
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
+            np_images = np.stack([np.asarray(image) for validation_prompt, image in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
             tracker.log(
                 {
                     "validation": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
+                        wandb.Image(image, caption=f"{i}: {validation_prompt}")
+                        for i, (validation_prompt, image) in enumerate(images)
                     ]
                 }
             )
@@ -388,6 +390,7 @@ def parse_args(input_args=None):
             "Run validation every X steps. Validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
             " and logging the images."
+            "Multiple validation prompts can be passed in by separating each prompt with \"|\" character."
         ),
     )
     parser.add_argument(
@@ -423,6 +426,12 @@ def parse_args(input_args=None):
             " behaviors, so disable this argument if it causes any problems. More info:"
             " https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.zero_grad.html"
         ),
+    )
+    parser.add_argument(
+        "--individual_stopping",
+        action="store_true",
+        help="Enables individual stopping per-class. "
+             "Stopping step index must be defined in stop_step.txt in each instance directory."
     )
 
     if input_args is not None:
@@ -460,13 +469,18 @@ class DreamBoothDataset(Dataset):
         instance_data_root,
         tokenizer,
         class_data_root=None,
+        class_prompt_root=None,
         class_num=None,
         size=512,
         center_crop=False,
+        individual_stopping=None
     ):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
+        self.cur_step = None
+        self.prev_step = None
+        self.individual_stopping = individual_stopping
 
         self.instance_data_root = Path(instance_data_root)
         if not self.instance_data_root.exists():
@@ -489,6 +503,11 @@ class DreamBoothDataset(Dataset):
             # self._length = max(self.num_class_images, self.num_instance_images)
         else:
             self.class_data_root = None
+        if class_prompt_root is not None:
+            self.class_prompt_root = Path(class_prompt_root)
+            self.class_prompt_root.mkdir(parents=True, exist_ok=True)
+        else:
+            self.class_data_root = None
 
         self.image_transforms = transforms.Compose(
             [
@@ -503,13 +522,15 @@ class DreamBoothDataset(Dataset):
         return self._length
 
     def __getitem__(self, index):
+        if self.individual_stopping and self.cur_step != self.prev_step:
+            # Check for individual stopping each new step iteration
+            self.individual_stop_check()
         example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
-        instance_prompt = ""
-        name = str(self.instance_images_path[index % self.num_instance_images])
-        with open(name.rsplit('/', 1)[0] + r'/prompt.txt', 'r') as f:
+        instance_image_dir = self.instance_images_path[index % self.num_instance_images]
+        instance_image = Image.open(instance_image_dir)
+        with open(os.path.join(os.path.dirname(instance_image_dir), "prompt.txt"), 'r') as f:
             instance_prompt = f.read()
-        #print("Accessing ", name.rsplit('/', 1)[0] + 'prompt.txt', instance_prompt)
+        # print(f"Accessed class instance image {repr(instance_prompt)}: {instance_image_dir}")
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
@@ -533,13 +554,13 @@ class DreamBoothDataset(Dataset):
         if self.class_data_root:
             class_images = self.class_data_root / str(self.instance_images_path[index % self.num_instance_images]).split(os.sep)[-2]
             class_images_path = list(class_images.iterdir())
-            class_image = Image.open(class_images_path[index % self.num_class_images])
-            name = str(class_images_path[index % self.num_class_images])
-            class_prompt = ""
-            with open(name.rsplit('/', 2)[0].replace('class_images', '') + "/class_prompts/" + name.rsplit('/', 1)[1].split('.')[0] + '.txt', 'r') as f:
+            class_image_path = class_images_path[index % self.num_class_images]
+            class_image = Image.open(class_image_path)
+            with open(os.path.join(self.class_prompt_root,
+                                   os.path.splitext(os.path.basename(class_image_path))[0] + ".txt"), 'r') as f:
                 class_prompt = f.read()
-            
-            # print("Accessing ", name, class_prompt)
+            # print(f"Accessed class regularization image {repr(class_prompt)}: {class_image_path}")
+
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
@@ -552,42 +573,49 @@ class DreamBoothDataset(Dataset):
             ).input_ids
             example["prompt"] = [instance_prompt, class_prompt]
 
+        self.prev_step = self.cur_step
         return example
+
+    def individual_stop_check(self):
+        # Enable with --individual_stopping
+        # Iterates through all the instances and if the cur_step is at the specified limit they are removed from the
+        # dataset
+        for instance_dir in self.instance_data_root.glob("*/"):
+            with open(os.path.join(instance_dir, "stop_step.txt"), "r") as stop_step_file:
+                stop_step = int(stop_step_file.read())
+                if self.cur_step == stop_step:
+                    # Remove the current instance from all the stored paths to stop training on it
+                    old_num_instance_images = self.num_instance_images
+                    self.instance_images_path = [p for p in self.instance_images_path if p.parent != instance_dir]
+                    self.num_instance_images = len(self.instance_images_path)
+                    assert self.num_instance_images < old_num_instance_images
+                    logger.info(f"\nStopping training on {instance_dir}.")
 
     """
     /dataset/
         (Provided Images)
         -instances/
-            (class name based on folder name)
-            -knightro/...
-                - prompt.txt -> a photo of sks knightro
-                - class_prompt.txt -> a photo of knightro
+            -class_1/...
+                - prompt.txt -> a photo of sks {class_1}
+                - class_prompt.txt -> a photo of {class_1}
+                - stop_step.txt -> # (stop training after these number of steps, requires --individual_stopping)
                 - 512x512 .jpg
-            -bunny/...
-                - prompt.txt -> a photo of zwx bunny
-                - class_prompt.txt -> a photo of bunny
+            -class_2/...
+                - prompt.txt -> a photo of zwx {class_2}
+                - class_prompt.txt -> a photo of {class_2}
                 - 512x512 .jpg
+            -.../...
         
         (Generated Regularization Images)
         -class_dir/
             -class_images/
-                -512x512 .jpg
+                -class_1/...
+                    -512x512 .jpg
+                -class_2/...
+                    -512x512 .jpg
             -class_prompts/
                 -prompt .txt (same name as associated image) -> a photo of a {rare_token} {class}
     """
-    def append_data(self, new_instance_dir, new_instance_prompt):
-        """
-        Reassign instance dir variables to new_instance_dir. Reassign to new instance prompt as well.
-        Take files in old_instance_dir and move them to the class_dir and images. Be sure to create
-        class_prompt text files for them as well.
-        Args:
-            new_instance_dir:
-            new_instance_prompt:
-
-        Returns:
-
-        """
-        pass
 
 def collate_fn(examples, with_prior_preservation=False):
     input_ids = [example["instance_prompt_ids"] for example in examples]
@@ -914,10 +942,12 @@ def main(args):
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+        class_prompt_root=args.class_prompt_dir if args.with_prior_preservation else None,
         class_num=args.num_class_images,
         tokenizer=tokenizer,
         size=args.resolution,
         center_crop=args.center_crop,
+        individual_stopping=args.individual_stopping
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -992,6 +1022,7 @@ def main(args):
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
+    train_dataloader.dataset.cur_step = global_step
     first_epoch = 0
 
     # Potentially load in the weights and states from a previous save
@@ -1028,6 +1059,7 @@ def main(args):
         if args.train_text_encoder:
             text_encoder.train()
         for step, batch in enumerate(train_dataloader):
+            train_dataloader.dataset.cur_step = global_step
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
