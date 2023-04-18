@@ -46,7 +46,6 @@ class UNet2DConditionOutput(BaseOutput):
         sample (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
             Hidden states conditioned on `encoder_hidden_states` input. Output of last layer of model.
     """
-
     sample: torch.FloatTensor
 
 
@@ -640,6 +639,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
             down_block_res_samples = new_down_block_res_samples
 
+        # print(f'down: {sample.shape}', flush=True)
+
         # 4. mid
         if self.mid_block is not None:
             sample = self.mid_block(
@@ -652,6 +653,8 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
 
         if mid_block_additional_residual is not None:
             sample = sample + mid_block_additional_residual
+        # print(f'mid: {sample.shape}', flush=True)
+        hidden_latents = sample
 
         # 5. up
         for i, upsample_block in enumerate(self.up_blocks):
@@ -679,7 +682,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 sample = upsample_block(
                     hidden_states=sample, temb=emb, res_hidden_states_tuple=res_samples, upsample_size=upsample_size
                 )
-
+            # print(f'up: {sample.shape}', flush=True)
         # 6. post-process
         if self.conv_norm_out:
             sample = self.conv_norm_out(sample)
@@ -689,4 +692,4 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         if not return_dict:
             return (sample,)
 
-        return UNet2DConditionOutput(sample=sample)
+        return UNet2DConditionOutput(sample=sample), UNet2DConditionOutput(sample=hidden_latents)

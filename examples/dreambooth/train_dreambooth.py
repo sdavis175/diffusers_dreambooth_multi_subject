@@ -22,6 +22,7 @@ import os
 import warnings
 from pathlib import Path
 from typing import Optional
+import copy
 
 import accelerate
 import numpy as np
@@ -37,6 +38,7 @@ from packaging import version
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.utils import save_image
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
@@ -48,10 +50,12 @@ from diffusers import (
     DPMSolverMultistepScheduler,
     UNet2DConditionModel,
 )
+
+# print(diffusers.__file__)
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-
+from nt_xent_original import NTXentLoss
 
 if is_wandb_available():
     import wandb
@@ -154,21 +158,21 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--instance_data_dir",
         type=str,
-        default=None,
-        required=True,
+        default=r'C:/Users/ny525072/PycharmProjects/diffusers_dreambooth_multi_subject/examples/dreambooth/dataset/instances/',
+        required=False,
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
         "--class_data_dir",
         type=str,
-        default=None,
+        default=r'C:\Users\ny525072\PycharmProjects\diffusers_dreambooth_multi_subject\examples\dreambooth\dataset\class_dir\class_images',
         required=False,
         help="A folder containing the training data of class images.",
     )
     parser.add_argument(
         "--class_prompt_dir",
         type=str,
-        default=None,
+        default=r'C:\Users\ny525072\PycharmProjects\diffusers_dreambooth_multi_subject\examples\dreambooth\dataset\class_dir\class_prompts',
         required=False,
         help="A folder containing the training data of class prompts.",
     )
@@ -455,13 +459,13 @@ class DreamBoothDataset(Dataset):
     """
 
     def __init__(
-        self,
-        instance_data_root,
-        tokenizer,
-        class_data_root=None,
-        class_num=None,
-        size=512,
-        center_crop=False,
+            self,
+            instance_data_root,
+            tokenizer,
+            class_data_root=None,
+            class_num=None,
+            size=512,
+            center_crop=False,
     ):
         self.size = size
         self.center_crop = center_crop
@@ -472,19 +476,21 @@ class DreamBoothDataset(Dataset):
             raise ValueError(f"Instance {self.instance_data_root} images root doesn't exists.")
 
         self.instance_images_path = list(Path(instance_data_root).rglob('*'))
-        self.instance_images_path = [i for i in self.instance_images_path if not os.path.basename(i).endswith('.txt') and not os.path.isdir(i)]
+        self.instance_images_path = [i for i in self.instance_images_path if
+                                     not os.path.basename(i).endswith('.txt') and not os.path.isdir(i)]
         self.num_instance_images = len(self.instance_images_path)
         self._length = self.num_instance_images
 
         if class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-            if class_num is not None:
-                self.num_class_images = min(len(self.class_images_path), class_num)
-            else:
-                self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
+            self.num_class_images = class_num
+            # self.class_images_path = list(self.class_data_root.iterdir())
+            # if class_num is not None:
+            #     self.num_class_images = min(len(self.class_images_path), class_num)
+            # else:
+            #     self.num_class_images = len(self.class_images_path)
+            # self._length = max(self.num_class_images, self.num_instance_images)
         else:
             self.class_data_root = None
 
@@ -505,9 +511,9 @@ class DreamBoothDataset(Dataset):
         instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
         instance_prompt = ""
         name = str(self.instance_images_path[index % self.num_instance_images])
-        with open(name.rsplit('/', 1)[0] + r'/prompt.txt', 'r') as f:
+        with open(name.rsplit(os.sep, 1)[0] + f'{os.sep}prompt.txt', 'r') as f:
             instance_prompt = f.read()
-        #print("Accessing ", name.rsplit('/', 1)[0] + 'prompt.txt', instance_prompt)
+        # print("Accessing ", name.rsplit('/', 1)[0] + 'prompt.txt', instance_prompt)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
@@ -518,14 +524,20 @@ class DreamBoothDataset(Dataset):
             max_length=self.tokenizer.model_max_length,
             return_tensors="pt",
         ).input_ids
+        example["prompt"] = instance_prompt
 
         if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            name = str(self.class_images_path[index % self.num_class_images])
+            class_images = self.class_data_root / \
+                           str(self.instance_images_path[index % self.num_instance_images]).split(os.sep)[-2]
+            class_images_path = list(class_images.iterdir())
+            class_image = Image.open(class_images_path[index % self.num_class_images])
+            name = str(class_images_path[index % self.num_class_images])
             class_prompt = ""
-            with open(name.rsplit('/', 2)[0] + "/class_prompts/" + name.rsplit('/', 1)[1].split('.')[0] + '.txt', 'r') as f:
+            with open(name.rsplit(os.sep, 2)[0].replace('class_images', '') + "/class_prompts/" +
+                      name.rsplit(os.sep, 1)[1].split('.')[0] + '.txt', 'r') as f:
                 class_prompt = f.read()
-            #print("Accessing ", name, class_prompt)
+
+            # print("Accessing ", name, class_prompt)
             if not class_image.mode == "RGB":
                 class_image = class_image.convert("RGB")
             example["class_images"] = self.image_transforms(class_image)
@@ -536,6 +548,7 @@ class DreamBoothDataset(Dataset):
                 max_length=self.tokenizer.model_max_length,
                 return_tensors="pt",
             ).input_ids
+            example["prompt"] = [instance_prompt, class_prompt]
 
         return example
 
@@ -552,7 +565,7 @@ class DreamBoothDataset(Dataset):
                 - prompt.txt -> a photo of zwx bunny
                 - class_prompt.txt -> a photo of bunny
                 - 512x512 .jpg
-        
+
         (Generated Regularization Images)
         -class_dir/
             -class_images/
@@ -560,6 +573,7 @@ class DreamBoothDataset(Dataset):
             -class_prompts/
                 -prompt .txt (same name as associated image) -> a photo of a {rare_token} {class}
     """
+
     def append_data(self, new_instance_dir, new_instance_prompt):
         """
         Reassign instance dir variables to new_instance_dir. Reassign to new instance prompt as well.
@@ -574,9 +588,11 @@ class DreamBoothDataset(Dataset):
         """
         pass
 
+
 def collate_fn(examples, with_prior_preservation=False):
     input_ids = [example["instance_prompt_ids"] for example in examples]
     pixel_values = [example["instance_images"] for example in examples]
+    prompts = [x for example in examples for x in example["prompt"]]
 
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
@@ -592,6 +608,7 @@ def collate_fn(examples, with_prior_preservation=False):
     batch = {
         "input_ids": input_ids,
         "pixel_values": pixel_values,
+        "prompts": prompts
     }
     return batch
 
@@ -625,6 +642,9 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
+    import sys
+    print(sys.version)
+    print(torch.__version__)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
 
@@ -679,24 +699,29 @@ def main(args):
         # Get the instances
         instances_dir = Path(args.instance_data_dir)
         instances = [instance.name for instance in instances_dir.glob("*") if instance.is_dir()]
-        cur_class_images = len(list(class_images_dir.iterdir())) // len(instances)
 
-        if cur_class_images < args.num_class_images:
-            torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-            if args.prior_generation_precision == "fp32":
-                torch_dtype = torch.float32
-            elif args.prior_generation_precision == "fp16":
-                torch_dtype = torch.float16
-            elif args.prior_generation_precision == "bf16":
-                torch_dtype = torch.bfloat16
-            pipeline = DiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                torch_dtype=torch_dtype,
-                safety_checker=None,
-                revision=args.revision,
-            )
-            pipeline.set_progress_bar_config(disable=True)
-            for instance in instances:
+        for instance in instances:
+            inst_class_dir = class_images_dir / instance
+            if not inst_class_dir.exists():
+                inst_class_dir.mkdir(parents=True)
+            cur_class_images = len(list(inst_class_dir.iterdir()))
+
+            if cur_class_images < args.num_class_images:
+                torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
+                if args.prior_generation_precision == "fp32":
+                    torch_dtype = torch.float32
+                elif args.prior_generation_precision == "fp16":
+                    torch_dtype = torch.float16
+                elif args.prior_generation_precision == "bf16":
+                    torch_dtype = torch.bfloat16
+                pipeline = DiffusionPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    torch_dtype=torch_dtype,
+                    safety_checker=None,
+                    revision=args.revision,
+                )
+                pipeline.set_progress_bar_config(disable=True)
+
                 num_new_images = args.num_class_images - cur_class_images
                 logger.info(f"Number of class images to sample: {num_new_images}.")
                 class_prompt_dir = Path(f"{args.instance_data_dir}/{instance}/class_prompt.txt")
@@ -716,15 +741,15 @@ def main(args):
 
                     for i, image in enumerate(images):
                         hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                        image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                        image_filename = inst_class_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
                         text_filename = class_prompts_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.txt"
                         with open(text_filename, "w") as text_file:
                             text_file.write(example["prompt"][i])
                         image.save(image_filename)
 
-            del pipeline
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                del pipeline
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -845,7 +870,7 @@ def main(args):
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -984,9 +1009,11 @@ def main(args):
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    prev_batch_pred = None
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
+        # print(f'epoch: {epoch}')
         if args.train_text_encoder:
             text_encoder.train()
         for step, batch in enumerate(train_dataloader):
@@ -998,8 +1025,12 @@ def main(args):
 
             with accelerator.accumulate(unet):
                 # Convert images to latent space
+                # print(f'batch: {batch["prompts"]}')
+                # continue
+                # print(f'pix val: {batch["pixel_values"].shape}')
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
+                # print(f'latents: {latents.shape}')
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
@@ -1013,10 +1044,12 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                encoder_hidden_states, text_embedding = text_encoder(batch["input_ids"])[:2]
 
                 # Predict the noise residual
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred, hidden_latents = unet(noisy_latents, timesteps, encoder_hidden_states)#.sample
+                model_pred, hidden_latents = model_pred.sample, hidden_latents.sample
+                # print(f'model_pred: {model_pred.shape}, hidden_latents: {hidden_latents.shape}')
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1026,10 +1059,22 @@ def main(args):
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
+                # Compute the loss.
                 if args.with_prior_preservation:
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                    # print(f'model_pred: {model_pred.shape}')
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    # print(f'model_pred: {model_pred.shape}, prior: {model_pred_prior.shape}')
+                    # if step < 4:
+                        # print(f'step {step}, image: {batch["pixel_values"][step].shape}, prompts: {batch["prompts"][step]}')
+
                     target, target_prior = torch.chunk(target, 2, dim=0)
+                    # print(f'target_pred: {target.shape}, tprior: {target_prior.shape}')
+                    # if epoch == 75:
+                    #     print(model_pred[0].shape)
+                    #     save_image(model_pred[0], 'model_pred0.png')
+                    #     print(model_pred.shape)
+                    #     save_image(model_pred, 'model_pred.png')
 
                     # Compute instance loss
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1037,22 +1082,46 @@ def main(args):
                     # Compute prior loss
                     prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
 
-                    # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
+                    if batch["prompts"][0] == batch["prompts"][2]:
+                        # print('same')
+                        distinctness_loss = F.mse_loss(hidden_latents[0], hidden_latents[2], reduction='mean')
+                        # distinctness_loss = 0
+
+                    else:
+                        # print('diff', hidden_latents.shape, hidden_latents[0].shape, hidden_latents[2].shape)
+                        # distinctness_loss = -F.mse_loss(hidden_latents[0], hidden_latents[2], reduction='mean')
+                        distinctness_loss = 0
+                        # print(distinctness_loss)
+                        # print(distinctness_loss.shape)
+                    loss = loss + (args.prior_loss_weight * prior_loss) + (distinctness_loss * 0.05)
+                    # loss = loss + (args.prior_loss_weight * prior_loss)
+
+
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=args.set_grads_to_none)
+                if args.train_text_encoder:
+                    if len(batch["prompts"]) == args.train_batch_size * 2:
+                        # TODO: think about way to generalize this statement.
+                        if batch["prompts"][0] != batch["prompts"][2]:
+                            # Compute the loss on the text encoder.
+                            text_enc_loss = NTXentLoss(device='cuda', batch_size=args.train_batch_size, temperature=0.1,
+                                                       use_cosine_similarity=True)(
+                                text_embedding[:args.train_batch_size], text_embedding[args.train_batch_size:])
+                            # text_enc_loss = text_enc_loss.mean()
+                            loss -= text_enc_loss
+                    # print(loss, type(loss))
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        params_to_clip = (
+                            itertools.chain(unet.parameters(), text_encoder.parameters())
+                            if args.train_text_encoder
+                            else unet.parameters()
+                        )
+                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
