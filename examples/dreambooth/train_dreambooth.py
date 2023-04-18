@@ -77,6 +77,7 @@ def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight
         vae=vae,
         revision=args.revision,
         torch_dtype=weight_dtype,
+        safety_checker=None
     )
     pipeline.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.scheduler.config)
     pipeline = pipeline.to(accelerator.device)
@@ -603,6 +604,7 @@ class DreamBoothDataset(Dataset):
             -class_2/...
                 - prompt.txt -> a photo of zwx {class_2}
                 - class_prompt.txt -> a photo of {class_2}
+                - stop_step.txt -> # (stop training after these number of steps, requires --individual_stopping)
                 - 512x512 .jpg
             -.../...
         
