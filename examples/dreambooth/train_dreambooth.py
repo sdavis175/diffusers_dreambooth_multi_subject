@@ -521,6 +521,14 @@ class DreamBoothDataset(Dataset):
             return_tensors="pt",
         ).input_ids
         example["prompt"] = instance_prompt
+        token = [x for x in ['sks', 'zwx', 'lun'] if x in instance_prompt][0]
+        example["identity"] = self.tokenizer(
+            token,
+            truncation=True,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids
 
         if self.class_data_root:
             class_images = self.class_data_root / str(self.instance_images_path[index % self.num_instance_images]).split(os.sep)[-2]
@@ -585,6 +593,7 @@ def collate_fn(examples, with_prior_preservation=False):
     input_ids = [example["instance_prompt_ids"] for example in examples]
     pixel_values = [example["instance_images"] for example in examples]
     prompts = [x for example in examples for x in example["prompt"]]
+    identities = list(set([example["identity"] for example in examples]))
 
     # Concat class and instance examples for prior preservation.
     # We do this to avoid doing two forward passes.
@@ -596,11 +605,13 @@ def collate_fn(examples, with_prior_preservation=False):
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
     input_ids = torch.cat(input_ids, dim=0)
+    identities = torch.cat(identities, dim=0)
 
     batch = {
         "input_ids": input_ids,
         "pixel_values": pixel_values,
-        "prompts": prompts
+        "prompts": prompts,
+        "identities": identities
     }
     return batch
 
@@ -779,8 +790,20 @@ def main(args):
     )
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision#, only_cross_attention=True
     )
+    # print(unet)
+    # for name, param in unet.named_parameters():
+    #     if 'to_k' not in name and 'to_v' not in name:
+    #         param.requires_grad = False
+    #     else:
+    #         print(name)
+
+    # for name, param in text_encoder.named_parameters():
+    #     if 'to_k' not in name and 'to_v' not in name:
+    #         param.requires_grad = False
+    #     else:
+    #         print(name)
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -926,6 +949,7 @@ def main(args):
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, text_encoder, optimizer, train_dataloader, lr_scheduler
         )
+        text_criterion = torch.nn.CosineSimilarity(dim=0)
     else:
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler
@@ -1057,16 +1081,98 @@ def main(args):
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
-                if args.train_text_encoder:
-                    if len(batch["prompts"]) == args.train_batch_size*2:
-                        # TODO: think about way to generalize this statement.
-                        if batch["prompts"][0] != batch["prompts"][2]:
-                            # Compute the loss on the text encoder.
-                            text_enc_loss = NTXentLoss(device='cuda', batch_size=args.train_batch_size, temperature=0.1, use_cosine_similarity=True)(text_embedding[:args.train_batch_size], text_embedding[args.train_batch_size:])
-                            # text_enc_loss = text_enc_loss.mean()
-                            loss -= text_enc_loss
 
-                accelerator.backward(loss)
+    ### Image loss - did not work :(
+    # prev_batch_pred = None
+
+    # for epoch in range(first_epoch, args.num_train_epochs):
+    #     unet.train()
+    #     if args.train_text_encoder:
+    #         text_encoder.train()
+    #     for step, batch in enumerate(train_dataloader):
+    #         # Skip steps until we reach the resumed step
+    #         if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+    #             if step % args.gradient_accumulation_steps == 0:
+    #                 progress_bar.update(1)
+    #             continue
+
+    #         with accelerator.accumulate(unet):
+    #             # Convert images to latent space
+    #             latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
+    #             latents = latents * vae.config.scaling_factor
+
+    #             # Sample noise that we'll add to the latents
+    #             noise = torch.randn_like(latents)
+    #             bsz = latents.shape[0]
+    #             # Sample a random timestep for each image
+    #             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+    #             timesteps = timesteps.long()
+
+    #             # Add noise to the latents according to the noise magnitude at each timestep
+    #             # (this is the forward diffusion process)
+    #             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    #             # Get the text embedding for conditioning
+    #             encoder_hidden_states, text_embedding = text_encoder(batch["input_ids"])[:2]
+
+    #             # Predict the noise residual
+    #             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+    #             # Get the target for loss depending on the prediction type
+    #             if noise_scheduler.config.prediction_type == "epsilon":
+    #                 target = noise
+    #             elif noise_scheduler.config.prediction_type == "v_prediction":
+    #                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
+    #             else:
+    #                 raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+    #             # Compute the loss.
+    #             if args.with_prior_preservation:
+    #                 # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+    #                 model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+    #                 target, target_prior = torch.chunk(target, 2, dim=0)
+    #                 # if epoch == 75:
+    #                 #     print(model_pred[0].shape)
+    #                 #     save_image(model_pred[0], 'model_pred0.png')
+    #                 #     print(model_pred.shape)
+    #                 #     save_image(model_pred, 'model_pred.png')
+
+    #                 # Compute instance loss
+    #                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+    #                 # Compute prior loss
+    #                 prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+
+    #                 if step != 0:
+    #                     distinctness_loss = -F.mse_loss(model_pred.float(), prev_batch_pred.float())
+
+    #                     # Add the prior loss to the instance loss.
+    #                     loss = loss + (args.prior_loss_weight * prior_loss) + distinctness_loss
+    #                 else:
+    #                     loss = loss + (args.prior_loss_weight * prior_loss)
+
+    #                 prev_batch_pred = model_pred
+
+                ###### END OF MODIFIED CODE ######
+                if args.train_text_encoder:
+                    # Early stop on training text encoder.
+                    if epoch < 75:
+                        # If batch is full.
+                        if len(batch["prompts"]) == args.train_batch_size*2:
+                            if batch["identities"].shape[0] > 1:
+                                new_text_embedding = text_encoder(batch["identities"]).pooler_output
+                                sim = 0
+                                for pair in itertools.combinations(list(new_text_embedding), 2):
+                                    sim += 1 - text_criterion(pair[0], pair[1])
+                                text_enc_loss = sim/len(list(itertools.combinations(list(new_text_embedding), 2)))
+                                # text_enc_loss = 1 - torch.nn.CosineSimilarity(dim=0)(new_text_embedding[0], new_text_embedding[1])
+                                loss -= text_enc_loss
+                                # if batch["prompts"][0] != batch["prompts"][2]:
+                                    # Compute the loss on the text encoder.
+                                    # text_enc_loss = NTXentLoss(device='cuda', batch_size=args.train_batch_size, temperature=0.1, use_cosine_similarity=True)(text_embedding[:args.train_batch_size], text_embedding[args.train_batch_size:])
+
+                accelerator.backward(loss, retain_graph=True)
+
                 if accelerator.sync_gradients:
                     params_to_clip = (
                         itertools.chain(unet.parameters(), text_encoder.parameters())
