@@ -85,20 +85,22 @@ def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight
     # run inference
     generator = None if args.seed is None else torch.Generator(device=accelerator.device).manual_seed(args.seed)
     images = []
-    for _ in range(args.num_validation_images):
-        with torch.autocast("cuda"):
-            image = pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
-        images.append(image)
+    for validation_prompt in args.validation_prompt.split("|"):
+        for _ in range(args.num_validation_images):
+            with torch.autocast("cuda"):
+                image = pipeline(validation_prompt, num_inference_steps=25, generator=generator).images[0]
+            images.append((validation_prompt, image))
 
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
+            np_images = np.stack([np.asarray(image) for validation_prompt, image in images])
             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
         if tracker.name == "wandb":
             tracker.log(
                 {
                     "validation": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
+                        wandb.Image(image, caption=f"{i}: {validation_prompt}")
+                        for i, (validation_prompt, image) in enumerate(images)
                     ]
                 }
             )
@@ -388,6 +390,7 @@ def parse_args(input_args=None):
             "Run validation every X steps. Validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
             " and logging the images."
+            "Multiple validation prompts can be passed in by separating each prompt with \"|\" character."
         ),
     )
     parser.add_argument(
@@ -581,7 +584,6 @@ class DreamBoothDataset(Dataset):
     /dataset/
         (Provided Images)
         -instances/
-            (class name based on folder name)
             -class_1/...
                 - prompt.txt -> a photo of sks {class_1}
                 - class_prompt.txt -> a photo of {class_1}
@@ -596,7 +598,10 @@ class DreamBoothDataset(Dataset):
         (Generated Regularization Images)
         -class_dir/
             -class_images/
-                -512x512 .jpg
+                -class_1/...
+                    -512x512 .jpg
+                -class_2/...
+                    -512x512 .jpg
             -class_prompts/
                 -prompt .txt (same name as associated image) -> a photo of a {rare_token} {class}
     """
