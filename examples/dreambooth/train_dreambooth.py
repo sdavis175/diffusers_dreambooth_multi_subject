@@ -570,15 +570,18 @@ class DreamBoothDataset(Dataset):
 
     def individual_stop_check(self):
         # Enable with --individual_stopping
-        # Iterates through all the instances and if the cur_step is past the specified limit they are removed from the
+        # Iterates through all the instances and if the cur_step is at the specified limit they are removed from the
         # dataset
         for instance_dir in self.instance_data_root.glob("*/"):
             with open(os.path.join(instance_dir, "stop_step.txt"), "r") as stop_step_file:
                 stop_step = int(stop_step_file.read())
-                if self.cur_step >= stop_step:
+                if self.cur_step == stop_step:
                     # Remove the current instance from all the stored paths to stop training on it
+                    old_num_instance_images = self.num_instance_images
                     self.instance_images_path = [p for p in self.instance_images_path if p.parent != instance_dir]
                     self.num_instance_images = len(self.instance_images_path)
+                    assert self.num_instance_images < old_num_instance_images
+                    logger.info(f"\nStopping training on {instance_dir}.")
 
     """
     /dataset/
