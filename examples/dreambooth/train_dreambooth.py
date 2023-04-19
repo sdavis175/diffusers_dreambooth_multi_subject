@@ -235,6 +235,7 @@ def parse_args(input_args=None):
         action="store_true",
         help="Whether to train the text encoder. If set, the text encoder should be float32 precision.",
     )
+    parser.add_argument("--text_encoder_loss_weight", type=float, default=1.0, help="The weight of text encoder loss.")
     parser.add_argument(
         "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
@@ -579,17 +580,16 @@ class DreamBoothDataset(Dataset):
 
     def individual_stop_check(self):
         # Enable with --individual_stopping
-        # Iterates through all the instances and if the cur_step is at the specified limit they are removed from the
+        # Iterates through all the instances and if the cur_step is past the specified limit they are removed from the
         # dataset
         for instance_dir in self.instance_data_root.glob("*/"):
             with open(os.path.join(instance_dir, "stop_step.txt"), "r") as stop_step_file:
                 stop_step = int(stop_step_file.read())
-                if self.cur_step == stop_step:
+                if self.cur_step >= stop_step and \
+                        len([p for p in self.instance_images_path if p.parent == instance_dir]) > 0:
                     # Remove the current instance from all the stored paths to stop training on it
-                    old_num_instance_images = self.num_instance_images
                     self.instance_images_path = [p for p in self.instance_images_path if p.parent != instance_dir]
                     self.num_instance_images = len(self.instance_images_path)
-                    assert self.num_instance_images < old_num_instance_images
                     logger.info(f"\nStopping training on {instance_dir}.")
 
     """
@@ -1198,7 +1198,7 @@ def main(args):
                                 sim += 1 - text_criterion(pair[0], pair[1])
                             text_enc_loss = sim/len(list(itertools.combinations(list(new_text_embedding), 2)))
                             # text_enc_loss = 1 - torch.nn.CosineSimilarity(dim=0)(new_text_embedding[0], new_text_embedding[1])
-                            loss -= text_enc_loss
+                            loss -= args.text_encoder_loss_weight * text_enc_loss
                             # if batch["prompts"][0] != batch["prompts"][2]:
                                 # Compute the loss on the text encoder.
                                 # text_enc_loss = NTXentLoss(device='cuda', batch_size=args.train_batch_size, temperature=0.1, use_cosine_similarity=True)(text_embedding[:args.train_batch_size], text_embedding[args.train_batch_size:])
